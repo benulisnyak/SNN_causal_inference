@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import re
 from pathlib import Path
@@ -482,6 +481,39 @@ def _reconstruct_matrix_from_edge_values(
     return M
 
 
+#function to save probability matrices for test networks
+def save_test_probability_matrices(
+    test_predictions,
+    test_network_metadata,
+    output_dir="prob_matrices",
+    file_prefix="prob_matrix",
+    dtype=np.float32,
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+
+    for meta in test_network_metadata:
+        flat_index = meta["flat_index"]
+        stats_name = meta["group"]
+        network_number = meta["group_local_index"] + 1
+
+        if flat_index not in test_predictions:
+            continue
+
+        prob_matrix = np.asarray(
+            test_predictions[flat_index]["global_prob_matrix"],
+            dtype=dtype,
+        )
+
+        save_path = output_dir / f"{file_prefix}_{stats_name}_{network_number}.npy"
+        np.save(save_path, prob_matrix)
+        saved_paths.append(save_path)
+
+    return saved_paths
+
+
 #function to safe binary metrics
 def _safe_binary_metrics(y_true, y_prob, y_pred):
     #calculate the score values for this set of predictions
@@ -765,7 +797,7 @@ def make_grouped_train_test_split(
     random_state=42,
     require_at_least_one_train_per_group=True,
 ):
-
+  
     if train_counts_by_group is None:
         train_counts_by_group = {}
     if test_counts_by_group is None:
@@ -920,6 +952,14 @@ def train_gbt_across_grouped_networks(
     test_metadata = [network_metadata[i] for i in split_info["test_indices"]]
     unused_metadata = [network_metadata[i] for i in split_info["unused_indices"]]
 
+    saved_prob_matrix_paths = save_test_probability_matrices(
+        test_predictions=results["test_predictions"],
+        test_network_metadata=test_metadata,
+        output_dir="prob_matrices",
+        file_prefix="prob_matrix",
+        dtype=np.float32,
+    )
+
     #adds the extra results and metadata into the result dictionary
     results.update({
         "all_matrices_lists": all_matrices_lists,
@@ -931,6 +971,7 @@ def train_gbt_across_grouped_networks(
         "train_network_metadata": train_metadata,
         "test_network_metadata": test_metadata,
         "unused_network_metadata": unused_metadata,
+        "saved_prob_matrix_paths": [str(path) for path in saved_prob_matrix_paths],
     })
     return results
 
@@ -967,7 +1008,7 @@ results_gbt = train_gbt_across_grouped_networks(
     #for any group not listed above:
     default_train_count=1,
     default_test_count=1,
-    shuffle_within_group=True,
+    shuffle_within_group=False,
     split_random_state=42,
 
     undirected=False,
@@ -986,3 +1027,6 @@ results_gbt = train_gbt_across_grouped_networks(
 print(results_gbt["overall_test_metrics"])
 print(results_gbt["feature_importance"].head(10))
 print(results_gbt["split_summary"])
+print("Saved probability matrices:")
+for path in results_gbt["saved_prob_matrix_paths"]:
+    print(path)
