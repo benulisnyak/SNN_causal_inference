@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
@@ -10,8 +11,10 @@ from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
+    auc,
     average_precision_score,
     f1_score,
+    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -44,6 +47,7 @@ base_dir = Path(".")
 learned_base_dir = base_dir / "LIFoutput_files"
 ground_truth_base_dir = base_dir / "networks"
 npy_pattern = "connectivity_matrices_*.npy"
+ei_output_base_dir = base_dir / "ei_prob_matrices"
 
 
 # -----------------------------------------------------------------------------
@@ -73,7 +77,6 @@ def load_one_npy_matrix_file(npy_path: str | Path) -> np.ndarray:
     return np.asarray(matrices, dtype=float)
 
 
-
 def load_all_connectivity_runs_from_one_folder(
     npy_dir: str | Path,
     pattern: str = "connectivity_matrices_*.npy",
@@ -94,7 +97,6 @@ def load_all_connectivity_runs_from_one_folder(
 
     matrices = [load_one_npy_matrix_file(path) for path in npy_files]
     return matrices, npy_files
-
 
 
 def load_ground_truth_signed_connectivity_matrix(
@@ -155,7 +157,6 @@ def load_ground_truth_signed_connectivity_matrix(
     return matrix, id_order
 
 
-
 def load_ground_truth_matrices_for_folder(
     stats_name: str,
     num_expected: int,
@@ -186,7 +187,6 @@ def load_ground_truth_matrices_for_folder(
         true_id_orders.append(id_order)
 
     return true_matrices, true_yaml_files, true_id_orders
-
 
 
 def load_all_connectivity_runs_multiple_folders(
@@ -229,7 +229,6 @@ def load_all_connectivity_runs_multiple_folders(
         }
 
     return results
-
 
 
 def main() -> dict[str, dict[str, object]]:
@@ -284,8 +283,8 @@ def derive_neuron_type_labels_from_ground_truth(
     Returns
     -------
     labels : np.ndarray, shape (N,)
-        1 = excitatory (all nonzero outgoing weights positive)
-        0 = inhibitory (all nonzero outgoing weights negative)
+        1 = inhibitory (all nonzero outgoing weights negative)
+        0 = excitatory (all nonzero outgoing weights positive)
         NaN = neuron has no nonzero outgoing weights, so label is unavailable
     """
     signed_A_t = np.asarray(signed_A_t, dtype=float)
@@ -313,7 +312,7 @@ def derive_neuron_type_labels_from_ground_truth(
                 f"Neuron index={i}, positive_count={np.sum(nz > 0)}, negative_count={np.sum(nz < 0)}"
             )
 
-        labels[i] = 1.0 if has_pos else 0.0
+        labels[i] = 1.0 if has_neg else 0.0
 
     return labels
 
@@ -377,7 +376,11 @@ def _node_stats_for_one_matrix(
     """
     Compute node-level statistics for one learned connectivity matrix.
 
-    Returns an array of shape (N, num_base_features).
+    Only the requested five summary statistics are used for both outgoing and
+    incoming connections: mean, minimum, maximum, standard deviation, and
+    median.
+
+    Returns an array of shape (N, 10).
     """
     M = np.asarray(matrix, dtype=float)
     if M.ndim != 2 or M.shape[0] != M.shape[1]:
@@ -390,44 +393,28 @@ def _node_stats_for_one_matrix(
 
     feature_blocks = [
         np.nanmean(M, axis=1, keepdims=True),   # outgoing mean
-        np.nanstd(M, axis=1, keepdims=True),    # outgoing std
-        np.nanmedian(M, axis=1, keepdims=True), # outgoing median
         np.nanmin(M, axis=1, keepdims=True),    # outgoing min
         np.nanmax(M, axis=1, keepdims=True),    # outgoing max
-        np.nansum(M, axis=1, keepdims=True),    # outgoing sum
-        np.nanmean(np.abs(M), axis=1, keepdims=True),  # outgoing abs mean
-        np.nansum(np.abs(M), axis=1, keepdims=True),   # outgoing abs sum
-        np.mean(np.abs(np.nan_to_num(M, nan=0.0)) > 0, axis=1, keepdims=True),
+        np.nanstd(M, axis=1, keepdims=True),    # outgoing std
+        np.nanmedian(M, axis=1, keepdims=True), # outgoing median
         np.nanmean(M, axis=0, keepdims=True).T,   # incoming mean
-        np.nanstd(M, axis=0, keepdims=True).T,    # incoming std
-        np.nanmedian(M, axis=0, keepdims=True).T, # incoming median
         np.nanmin(M, axis=0, keepdims=True).T,    # incoming min
         np.nanmax(M, axis=0, keepdims=True).T,    # incoming max
-        np.nansum(M, axis=0, keepdims=True).T,    # incoming sum
-        np.nanmean(np.abs(M), axis=0, keepdims=True).T,  # incoming abs mean
-        np.nansum(np.abs(M), axis=0, keepdims=True).T,   # incoming abs sum
-        np.mean(np.abs(np.nan_to_num(M, nan=0.0)) > 0, axis=0, keepdims=True).T,
+        np.nanstd(M, axis=0, keepdims=True).T,    # incoming std
+        np.nanmedian(M, axis=0, keepdims=True).T, # incoming median
     ]
 
     feature_names = [
         "out_mean",
-        "out_std",
-        "out_median",
         "out_min",
         "out_max",
-        "out_sum",
-        "out_abs_mean",
-        "out_abs_sum",
-        "out_nonzero_frac",
+        "out_std",
+        "out_median",
         "in_mean",
-        "in_std",
-        "in_median",
         "in_min",
         "in_max",
-        "in_sum",
-        "in_abs_mean",
-        "in_abs_sum",
-        "in_nonzero_frac",
+        "in_std",
+        "in_median",
     ]
 
     X = np.hstack(feature_blocks)
@@ -437,7 +424,6 @@ def _node_stats_for_one_matrix(
         )
 
     return X, feature_names
-
 
 
 def _build_node_features_for_one_network(
@@ -480,7 +466,10 @@ def _build_node_features_for_one_network(
         )
 
         if K_used > 0:
-            block = per_matrix_stack[:K_used].transpose(1, 0, 2).reshape(n_nodes, K_used * num_base_features)
+            block = per_matrix_stack[:K_used].transpose(1, 0, 2).reshape(
+                n_nodes,
+                K_used * num_base_features,
+            )
             X_base[:, : K_used * num_base_features] = block
 
         X_parts.append(X_base)
@@ -521,7 +510,6 @@ def _build_node_features_for_one_network(
     return X, y, neuron_indices, feature_names
 
 
-
 def _reconstruct_neuron_vector(
     values: np.ndarray,
     neuron_indices: np.ndarray,
@@ -535,8 +523,11 @@ def _reconstruct_neuron_vector(
     return out
 
 
-
-def _safe_binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+def _safe_binary_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    y_pred: np.ndarray,
+) -> dict[str, float]:
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
@@ -545,13 +536,261 @@ def _safe_binary_metrics(y_true: np.ndarray, y_prob: np.ndarray, y_pred: np.ndar
     }
 
     if len(np.unique(y_true)) > 1:
+        pr_precision, pr_recall, _ = precision_recall_curve(y_true, y_prob)
         metrics["roc_auc"] = float(roc_auc_score(y_true, y_prob))
+        metrics["pr_auc"] = float(auc(pr_recall, pr_precision))
         metrics["average_precision"] = float(average_precision_score(y_true, y_prob))
     else:
         metrics["roc_auc"] = np.nan
+        metrics["pr_auc"] = np.nan
         metrics["average_precision"] = np.nan
 
     return metrics
+
+
+def _numeric_series_without_nan(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").dropna()
+
+
+# -----------------------------------------------------------------------------
+# saving helpers
+# -----------------------------------------------------------------------------
+
+def save_test_prediction_arrays(
+    test_predictions: dict[int, dict[str, object]],
+    test_network_metadata: list[dict[str, object]],
+    output_dir: str | Path = "ei_prob_matrices",
+    *,
+    prob_prefix: str = "ei_prob_vector",
+    binary_prefix: str = "ei_binary_vector",
+    truth_prefix: str = "ei_truth_vector",
+    prob_dtype: np.dtype = np.float32,
+) -> pd.DataFrame:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_rows: list[dict[str, object]] = []
+
+    for meta in test_network_metadata:
+        flat_index = meta["flat_index"]
+        if flat_index not in test_predictions:
+            continue
+
+        stats_name = meta["group"]
+        network_number = meta["group_local_index"] + 1
+        pred_entry = test_predictions[flat_index]
+
+        prob_vector = np.asarray(pred_entry["global_prob_vector"], dtype=prob_dtype)
+        binary_vector = np.asarray(pred_entry["global_binary_vector"], dtype=np.int16)
+        truth_vector = np.asarray(pred_entry["global_truth_vector"], dtype=np.float32)
+
+        prob_path = output_dir / f"{prob_prefix}_{stats_name}_{network_number}.npy"
+        binary_path = output_dir / f"{binary_prefix}_{stats_name}_{network_number}.npy"
+        truth_path = output_dir / f"{truth_prefix}_{stats_name}_{network_number}.npy"
+
+        np.save(prob_path, prob_vector)
+        np.save(binary_path, binary_vector)
+        np.save(truth_path, truth_vector)
+
+        saved_rows.append(
+            {
+                "flat_index": flat_index,
+                "group": stats_name,
+                "group_local_index": meta["group_local_index"],
+                "network_number": network_number,
+                "npy_file": meta["npy_file"],
+                "true_yaml_file": meta["true_yaml_file"],
+                "prob_vector_path": str(prob_path),
+                "binary_vector_path": str(binary_path),
+                "truth_vector_path": str(truth_path),
+            }
+        )
+
+    return pd.DataFrame(saved_rows)
+
+
+def build_test_network_auc_summary(
+    test_predictions: dict[int, dict[str, object]],
+    test_network_metadata: list[dict[str, object]],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+
+    for meta in test_network_metadata:
+        flat_index = meta["flat_index"]
+        if flat_index not in test_predictions:
+            continue
+
+        pred_entry = test_predictions[flat_index]
+        metrics = pred_entry["metrics"]
+
+        rows.append(
+            {
+                "flat_index": flat_index,
+                "group": meta["group"],
+                "group_local_index": meta["group_local_index"],
+                "network_number": meta["group_local_index"] + 1,
+                "npy_file": meta["npy_file"],
+                "true_yaml_file": meta["true_yaml_file"],
+                "N": meta["N"],
+                "num_labeled_neurons": meta["num_labeled_neurons"],
+                "num_excitatory_neurons": meta["num_excitatory_neurons"],
+                "num_inhibitory_neurons": meta["num_inhibitory_neurons"],
+                "accuracy": metrics["accuracy"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "roc_auc": metrics["roc_auc"],
+                "pr_auc": metrics["pr_auc"],
+                "average_precision": metrics["average_precision"],
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def save_combination_outputs(
+    results: dict[str, object],
+    combo_dir: str | Path,
+    *,
+    train_count: int,
+    test_count: int,
+    prob_dtype: np.dtype = np.float32,
+) -> dict[str, object]:
+    combo_dir = Path(combo_dir)
+    combo_dir.mkdir(parents=True, exist_ok=True)
+
+    prediction_manifest_df = save_test_prediction_arrays(
+        test_predictions=results["test_predictions"],
+        test_network_metadata=results["test_network_metadata"],
+        output_dir=combo_dir,
+        prob_dtype=prob_dtype,
+    )
+    prediction_manifest_path = combo_dir / "saved_prediction_arrays.csv"
+    prediction_manifest_df.to_csv(prediction_manifest_path, index=False)
+
+    feature_importance_df = results["feature_importance"].copy()
+    feature_importance_path = combo_dir / "feature_importance.csv"
+    feature_importance_df.to_csv(feature_importance_path, index=False)
+
+    split_summary_df = results["split_summary"].copy()
+    split_summary_path = combo_dir / "split_summary.csv"
+    split_summary_df.to_csv(split_summary_path, index=False)
+
+    overall_metrics_row = dict(results["overall_test_metrics"])
+    overall_metrics_row.update(
+        {
+            "train_count_per_group": train_count,
+            "test_count_per_group": test_count,
+        }
+    )
+    overall_metrics_df = pd.DataFrame([overall_metrics_row])
+    overall_metrics_path = combo_dir / "overall_test_metrics.csv"
+    overall_metrics_df.to_csv(overall_metrics_path, index=False)
+
+    test_auc_df = build_test_network_auc_summary(
+        test_predictions=results["test_predictions"],
+        test_network_metadata=results["test_network_metadata"],
+    )
+    test_auc_path = combo_dir / "test_network_auc_summary.csv"
+    test_auc_df.to_csv(test_auc_path, index=False)
+
+    valid_roc_auc = _numeric_series_without_nan(test_auc_df, "roc_auc")
+    valid_pr_auc = _numeric_series_without_nan(test_auc_df, "pr_auc")
+
+    auc_summary_row = {
+        "train_count_per_group": train_count,
+        "test_count_per_group": test_count,
+        "mean_test_network_roc_auc": float(valid_roc_auc.mean()) if len(valid_roc_auc) > 0 else np.nan,
+        "std_test_network_roc_auc": float(valid_roc_auc.std(ddof=0)) if len(valid_roc_auc) > 0 else np.nan,
+        "valid_test_network_roc_auc_count": int(len(valid_roc_auc)),
+        "mean_test_network_pr_auc": float(valid_pr_auc.mean()) if len(valid_pr_auc) > 0 else np.nan,
+        "std_test_network_pr_auc": float(valid_pr_auc.std(ddof=0)) if len(valid_pr_auc) > 0 else np.nan,
+        "valid_test_network_pr_auc_count": int(len(valid_pr_auc)),
+        "total_test_network_count": int(len(test_auc_df)),
+    }
+    auc_summary_df = pd.DataFrame([auc_summary_row])
+    auc_summary_path = combo_dir / "auc_summary.csv"
+    auc_summary_df.to_csv(auc_summary_path, index=False)
+
+    return {
+        "train_count_per_group": train_count,
+        "test_count_per_group": test_count,
+        "combo_dir": str(combo_dir),
+        "feature_importance_path": str(feature_importance_path),
+        "split_summary_path": str(split_summary_path),
+        "overall_metrics_path": str(overall_metrics_path),
+        "test_auc_summary_path": str(test_auc_path),
+        "auc_summary_path": str(auc_summary_path),
+        "saved_prediction_arrays_path": str(prediction_manifest_path),
+        **overall_metrics_row,
+        **auc_summary_row,
+    }
+
+
+def create_auc_heatmap(
+    summary_df: pd.DataFrame,
+    *,
+    value_column: str,
+    title: str,
+    colorbar_label: str,
+    output_png: str | Path,
+    output_csv: str | Path,
+    annotate: bool = True,
+) -> None:
+    output_png = Path(output_png)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+
+    pivot_df = (
+        summary_df.pivot(
+            index="train_count_per_group",
+            columns="test_count_per_group",
+            values=value_column,
+        )
+        .sort_index()
+        .sort_index(axis=1)
+    )
+
+    pivot_df.to_csv(output_csv, index=True)
+
+    train_counts = list(pivot_df.index)
+    test_counts = list(pivot_df.columns)
+    values = pivot_df.to_numpy(dtype=float)
+
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(color="lightgray")
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    image = ax.imshow(np.ma.masked_invalid(values), aspect="auto", origin="lower", cmap=cmap)
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label(colorbar_label)
+
+    ax.set_title(title)
+    ax.set_xlabel("Number of test networks per statistical class")
+    ax.set_ylabel("Number of train networks per statistical class")
+    ax.set_xticks(np.arange(len(test_counts)))
+    ax.set_xticklabels(test_counts)
+    ax.set_yticks(np.arange(len(train_counts)))
+    ax.set_yticklabels(train_counts)
+
+    if annotate:
+        for i in range(values.shape[0]):
+            for j in range(values.shape[1]):
+                val = values[i, j]
+                if not np.isnan(val):
+                    ax.text(
+                        j,
+                        i,
+                        f"{val:.3f}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                    )
+
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
@@ -742,7 +981,7 @@ def train_gbt_across_networks(
         "max_num_matrices": max_num_matrices,
         "test_predictions": test_predictions,
         "overall_test_metrics": overall_test_metrics,
-        "label_definition": {0: "inhibitory", 1: "excitatory"},
+        "label_definition": {0: "excitatory", 1: "inhibitory"},
     }
 
 
@@ -782,8 +1021,8 @@ def flatten_loaded_data_by_group(
         ):
             neuron_labels = derive_neuron_type_labels_from_ground_truth(true_A)
             labeled_count = int(np.sum(~np.isnan(neuron_labels)))
-            excitatory_count = int(np.sum(neuron_labels == 1))
-            inhibitory_count = int(np.sum(neuron_labels == 0))
+            inhibitory_count = int(np.sum(neuron_labels == 1))
+            excitatory_count = int(np.sum(neuron_labels == 0))
 
             all_matrices_lists.append(np.asarray(learned_arr, dtype=float))
             all_signed_A_t.append(np.asarray(true_A, dtype=float))
@@ -804,7 +1043,6 @@ def flatten_loaded_data_by_group(
             )
 
     return all_matrices_lists, all_signed_A_t, group_labels, network_metadata
-
 
 
 def make_grouped_train_test_split(
@@ -903,7 +1141,6 @@ def make_grouped_train_test_split(
     }
 
 
-
 def train_gbt_across_grouped_networks(
     all_data: dict[str, dict[str, object]],
     *,
@@ -974,38 +1211,179 @@ def train_gbt_across_grouped_networks(
 
 
 # -----------------------------------------------------------------------------
+# train/test sweep across all valid combinations
+# -----------------------------------------------------------------------------
+
+def run_all_train_test_combinations(
+    all_data: dict[str, dict[str, object]],
+    *,
+    output_root: str | Path = ei_output_base_dir,
+    min_train_count: int = 1,
+    max_train_count: int = 10,
+    min_test_count: int = 1,
+    max_test_count: int = 10,
+    networks_per_group: int = 11,
+    shuffle_within_group: bool = False,
+    split_random_state: int = 42,
+    exclude_diagonal: bool = True,
+    use_per_matrix_features: bool = False,
+    add_summary_features: bool = True,
+    threshold: float = 0.5,
+    random_state: int = 42,
+    n_estimators: int = 200,
+    learning_rate: float = 0.05,
+    max_depth: int = 5,
+    subsample: float = 0.8,
+) -> dict[str, object]:
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    combination_rows: list[dict[str, object]] = []
+    combination_results: dict[tuple[int, int], dict[str, object]] = {}
+    all_pr_auc_values: list[np.ndarray] = []
+
+    for train_count in range(min_train_count, max_train_count + 1):
+        for test_count in range(min_test_count, max_test_count + 1):
+            if train_count + test_count > networks_per_group:
+                continue
+
+            combo_name = f"train_{train_count}_test_{test_count}"
+            combo_dir = output_root / combo_name
+            print(f"Running {combo_name} ...")
+
+            results = train_gbt_across_grouped_networks(
+                all_data=all_data,
+                default_train_count=train_count,
+                default_test_count=test_count,
+                shuffle_within_group=shuffle_within_group,
+                split_random_state=split_random_state,
+                exclude_diagonal=exclude_diagonal,
+                use_per_matrix_features=use_per_matrix_features,
+                add_summary_features=add_summary_features,
+                threshold=threshold,
+                random_state=random_state,
+                n_estimators=n_estimators,
+                learning_rate=learning_rate,
+                max_depth=max_depth,
+                subsample=subsample,
+            )
+
+            combo_test_auc_df = build_test_network_auc_summary(
+                test_predictions=results["test_predictions"],
+                test_network_metadata=results["test_network_metadata"],
+            )
+            valid_combo_pr_auc = _numeric_series_without_nan(combo_test_auc_df, "pr_auc")
+            if len(valid_combo_pr_auc) > 0:
+                all_pr_auc_values.append(valid_combo_pr_auc.to_numpy(dtype=float))
+
+            combo_summary = save_combination_outputs(
+                results=results,
+                combo_dir=combo_dir,
+                train_count=train_count,
+                test_count=test_count,
+            )
+
+            combination_rows.append(combo_summary)
+            combination_results[(train_count, test_count)] = results
+
+    if not combination_rows:
+        raise RuntimeError("No valid train/test combinations were run.")
+
+    master_summary_df = pd.DataFrame(combination_rows).sort_values(
+        ["train_count_per_group", "test_count_per_group"]
+    )
+    master_summary_path = output_root / "all_train_test_combination_metrics.csv"
+    master_summary_df.to_csv(master_summary_path, index=False)
+
+    create_auc_heatmap(
+        master_summary_df,
+        value_column="mean_test_network_roc_auc",
+        title="Mean test-network ROC AUC across train/test combinations",
+        colorbar_label="Mean ROC AUC",
+        output_png=output_root / "heatmap_mean_test_network_roc_auc.png",
+        output_csv=output_root / "heatmap_mean_test_network_roc_auc_values.csv",
+    )
+
+    create_auc_heatmap(
+        master_summary_df,
+        value_column="std_test_network_roc_auc",
+        title="Std. dev. of test-network ROC AUC across train/test combinations",
+        colorbar_label="ROC AUC standard deviation",
+        output_png=output_root / "heatmap_std_test_network_roc_auc.png",
+        output_csv=output_root / "heatmap_std_test_network_roc_auc_values.csv",
+    )
+
+    create_auc_heatmap(
+        master_summary_df,
+        value_column="mean_test_network_pr_auc",
+        title="Mean test-network precision-recall AUC across train/test combinations",
+        colorbar_label="Mean precision-recall AUC",
+        output_png=output_root / "heatmap_mean_test_network_pr_auc.png",
+        output_csv=output_root / "heatmap_mean_test_network_pr_auc_values.csv",
+    )
+
+    create_auc_heatmap(
+        master_summary_df,
+        value_column="std_test_network_pr_auc",
+        title="Std. dev. of test-network precision-recall AUC across train/test combinations",
+        colorbar_label="Precision-recall AUC standard deviation",
+        output_png=output_root / "heatmap_std_test_network_pr_auc.png",
+        output_csv=output_root / "heatmap_std_test_network_pr_auc_values.csv",
+    )
+
+    if all_pr_auc_values:
+        global_pr_auc = np.concatenate(all_pr_auc_values)
+        global_pr_auc_mean = float(np.mean(global_pr_auc))
+        global_pr_auc_std = float(np.std(global_pr_auc, ddof=0))
+        global_pr_auc_count = int(global_pr_auc.size)
+    else:
+        global_pr_auc_mean = np.nan
+        global_pr_auc_std = np.nan
+        global_pr_auc_count = 0
+
+    global_pr_auc_summary = pd.DataFrame(
+        [
+            {
+                "global_mean_pr_auc": global_pr_auc_mean,
+                "global_std_pr_auc": global_pr_auc_std,
+                "global_valid_test_network_pr_auc_count": global_pr_auc_count,
+                "num_train_test_combinations": int(len(master_summary_df)),
+            }
+        ]
+    )
+    global_pr_auc_summary_path = output_root / "global_pr_auc_summary.csv"
+    global_pr_auc_summary.to_csv(global_pr_auc_summary_path, index=False)
+
+    return {
+        "master_summary": master_summary_df,
+        "master_summary_path": str(master_summary_path),
+        "mean_auc_heatmap_path": str(output_root / "heatmap_mean_test_network_roc_auc.png"),
+        "std_auc_heatmap_path": str(output_root / "heatmap_std_test_network_roc_auc.png"),
+        "mean_pr_auc_heatmap_path": str(output_root / "heatmap_mean_test_network_pr_auc.png"),
+        "std_pr_auc_heatmap_path": str(output_root / "heatmap_std_test_network_pr_auc.png"),
+        "global_pr_auc_mean": global_pr_auc_mean,
+        "global_pr_auc_std": global_pr_auc_std,
+        "global_pr_auc_count": global_pr_auc_count,
+        "global_pr_auc_summary_path": str(global_pr_auc_summary_path),
+        "combination_results": combination_results,
+    }
+
+
+# -----------------------------------------------------------------------------
 # example run
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     all_data = main()
 
-    results_gbt = train_gbt_across_grouped_networks(
+    sweep_results = run_all_train_test_combinations(
         all_data=all_data,
-        train_counts_by_group={
-            "N100_p12_CC01": 10,
-            "N100_p12_CC03": 10,
-            "N100_p12_CC05": 10,
-            "N100_p24_CC01": 10,
-            "N100_p24_CC03": 10,
-            "N100_p24_CC05": 10,
-            "N100_p36_CC01": 10,
-            "N100_p36_CC03": 10,
-            "N100_p36_CC05": 10,
-        },
-        test_counts_by_group={
-            "N100_p12_CC01": 1,
-            "N100_p12_CC03": 1,
-            "N100_p12_CC05": 1,
-            "N100_p24_CC01": 1,
-            "N100_p24_CC03": 1,
-            "N100_p24_CC05": 1,
-            "N100_p36_CC01": 1,
-            "N100_p36_CC03": 1,
-            "N100_p36_CC05": 1,
-        },
-        default_train_count=1,
-        default_test_count=1,
+        output_root=ei_output_base_dir,
+        min_train_count=1,
+        max_train_count=10,
+        min_test_count=1,
+        max_test_count=10,
+        networks_per_group=11,
         shuffle_within_group=False,
         split_random_state=42,
         exclude_diagonal=True,
@@ -1019,17 +1397,29 @@ if __name__ == "__main__":
         subsample=0.8,
     )
 
-    print("Overall test metrics:")
-    print(results_gbt["overall_test_metrics"])
+    print()
+    print("Saved master summary:")
+    print(sweep_results["master_summary_path"])
     print()
 
-    print("Top 10 feature importances:")
-    print(results_gbt["feature_importance"].head(10))
+    print("Saved heatmaps:")
+    print(sweep_results["mean_auc_heatmap_path"])
+    print(sweep_results["std_auc_heatmap_path"])
+    print(sweep_results["mean_pr_auc_heatmap_path"])
+    print(sweep_results["std_pr_auc_heatmap_path"])
     print()
 
-    print("Split summary:")
-    print(results_gbt["split_summary"])
+    print("Saved global precision-recall AUC summary:")
+    print(sweep_results["global_pr_auc_summary_path"])
     print()
 
-    print("Label definition:")
-    print(results_gbt["label_definition"])
+    print(
+        "Global precision-recall AUC across all train/test combinations: "
+        f"mean={sweep_results['global_pr_auc_mean']:.6f}, "
+        f"std={sweep_results['global_pr_auc_std']:.6f}, "
+        f"n={sweep_results['global_pr_auc_count']}"
+    )
+    print()
+
+    print("Top rows of the master summary:")
+    print(sweep_results["master_summary"].head())
