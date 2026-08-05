@@ -1,5 +1,3 @@
-# Code that trains a SNN of LIF neurons to learn internal connections that reproduce the time series of a sample of burst activity
-# This is currently an earlier version that works well for connectomics burst sample spiking data, but is not robustly coded yet (this project is still in progress)
 import os
 import math
 import argparse
@@ -15,11 +13,14 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 
-
+# -----------------------------
 # Device / reproducibility
+# -----------------------------
 seed = 15
 input_path = ""
 data_dtres = 0.004
+min_network_activity_fraction = 0.9
+nest_burst_detection_window_ms = 50.0
 
 
 def configure_global_reproducibility(seed: int = 15):
@@ -35,121 +36,244 @@ def configure_global_reproducibility(seed: int = 15):
     torch.backends.cudnn.benchmark = False
 
 
-
-# Burst extraction, isolates bursts as activity 'samples' for training on
-
+# -----------------------------
+# Burst extraction
+# -----------------------------
 def extract_bursts_from_spiketrain(
     data: torch.Tensor,
     data_dtres: float,
-    consec_spikes: int = 4,
-    silence_gap: int = 3,
-    start_silence_gap: int = 1,
+    nest_window_ms: float = 50.0,
+    min_network_activity_fraction: float = 0.9,
     spike_threshold: float = 0.5,
     min_burst_len: int | None = None,
     max_burst_len: int | None = None,
     return_device: torch.device | None = None,
 ):
     """
-    data: [T, N] spike train (0/1 or float)
-    Returns:
-      burst_samples: list of tensors [T_burst, N] (float32)
-      burst_meta: list of dicts with start/end indices (absolute in original data)
+    Detect bursts using the same population-activity criterion as
+    NEST_meta_routines.determine_burst_rate() and then crop each detected burst
+    for SNN training.
+
+    NEST detection criterion
+    ------------------------
+    1. Divide time into non-overlapping ``nest_window_ms`` windows (50 ms in
+       NEST_smallNetworks.py).
+    2. Within each window, count the number of unique neurons that spiked at
+       least once.
+    3. Mark the window as burst-active when
+
+           unique_active_neurons / N > min_network_activity_fraction
+
+       The strict ``>`` comparison intentionally matches the NEST code.
+    4. A new burst is detected on each 0 -> 1 transition of this binary
+       window-level signal. Consecutive burst-active windows belong to the same
+       burst.
+
+    Training-sample crop
+    --------------------
+    For every detected NEST burst, locate the 4 ms bin with maximum population
+    activity inside its run of burst-active 50 ms windows. Starting at that
+    peak, backtrack through consecutive 4 ms bins that each contain at least one
+    active neuron. The returned sample therefore runs from the first bin of
+    continuous activity through the population-activity peak, inclusive.
+
+    Because the input has already been reduced to binary 4 ms occupancy, exact
+    spike times within each 4 ms bin are unavailable. Each 4 ms bin is assigned
+    to a NEST window using its bin-centre time. This is the closest deterministic
+    reconstruction of the original 50 ms detector from the binned data.
+
+    Parameters
+    ----------
+    data:
+        Tensor of shape [T, N], containing binary or floating-point spike-bin
+        occupancy.
+    data_dtres:
+        Width of each input time bin in seconds (normally 0.004).
+    nest_window_ms:
+        Width of the NEST population-activity window in milliseconds.
+    min_network_activity_fraction:
+        NEST burst threshold. A window is active only when the fraction is
+        strictly greater than this value.
+    min_burst_len, max_burst_len:
+        Optional limits on the final cropped 4 ms training samples.
+
+    Returns
+    -------
+    burst_samples:
+        List of float32 tensors with shape [T_burst, N].
+    burst_meta:
+        Detection and crop metadata using absolute 4 ms-bin indices.
     """
     assert data.dim() == 2, "Expected data shape [T, N]"
+    if data_dtres <= 0.0:
+        raise ValueError("data_dtres must be > 0")
+    if nest_window_ms <= 0.0:
+        raise ValueError("nest_window_ms must be > 0")
+    if not (0.0 <= min_network_activity_fraction <= 1.0):
+        raise ValueError("min_network_activity_fraction must be between 0.0 and 1.0")
+    if min_burst_len is not None and min_burst_len < 1:
+        raise ValueError("min_burst_len must be >= 1 when provided")
+    if max_burst_len is not None and max_burst_len < 1:
+        raise ValueError("max_burst_len must be >= 1 when provided")
+    if (
+        min_burst_len is not None
+        and max_burst_len is not None
+        and min_burst_len > max_burst_len
+    ):
+        raise ValueError("min_burst_len cannot be greater than max_burst_len")
+
     T, N = data.shape
-    if min_burst_len is None:
-        min_burst_len = consec_spikes
+    if T == 0 or N == 0:
+        return [], []
 
     x = data.detach().to("cpu")
     x = (x > spike_threshold).to(torch.uint8)
-    global_active = x.sum(dim=1) > 0
+    global_active = x.any(dim=1)
+
+    # NEST uses non-overlapping 50 ms intervals. Since 50 ms is not an integer
+    # multiple of 4 ms, assign each 4 ms occupancy bin according to its centre
+    # time. Boundary times belong to the earlier window, matching NEST's <= test.
+    bin_dt_ms = float(data_dtres) * 1000.0
+    total_duration_ms = float(T) * bin_dt_ms
+    num_complete_windows = int(total_duration_ms // float(nest_window_ms))
+    if num_complete_windows < 1:
+        return [], []
+
+    bin_centres_ms = (torch.arange(T, dtype=torch.float64) + 0.5) * bin_dt_ms
+    window_edges_ms = torch.arange(
+        num_complete_windows + 1,
+        dtype=torch.float64,
+    ) * float(nest_window_ms)
+
+    # searchsorted(..., right=False) maps a centre exactly on an upper boundary
+    # to the preceding window, consistent with xtimes <= ttExactMS + tauMS.
+    window_for_bin = torch.searchsorted(
+        window_edges_ms,
+        bin_centres_ms,
+        right=False,
+    ) - 1
+
+    valid_bin = (window_for_bin >= 0) & (window_for_bin < num_complete_windows)
+    active_counts = torch.zeros(num_complete_windows, dtype=torch.int64)
+    active_neuron_masks = []
+
+    for window_idx in range(num_complete_windows):
+        bins_in_window = valid_bin & (window_for_bin == window_idx)
+        if bins_in_window.any():
+            neurons_active = x[bins_in_window].any(dim=0)
+        else:
+            neurons_active = torch.zeros(N, dtype=torch.bool)
+        active_neuron_masks.append(neurons_active)
+        active_counts[window_idx] = int(neurons_active.sum().item())
+
+    active_fractions = active_counts.to(torch.float64) / float(N)
+    nest_burst_active = active_fractions > float(min_network_activity_fraction)
+
+    # Match the NEST 0 -> 1 transition logic, while grouping consecutive active
+    # 50 ms windows as one detected burst.
+    burst_window_runs = []
+    window_idx = 0
+    while window_idx < num_complete_windows:
+        if not bool(nest_burst_active[window_idx].item()):
+            window_idx += 1
+            continue
+
+        run_start_window = window_idx
+        while (
+            window_idx + 1 < num_complete_windows
+            and bool(nest_burst_active[window_idx + 1].item())
+        ):
+            window_idx += 1
+        run_end_window = window_idx
+        burst_window_runs.append((run_start_window, run_end_window))
+        window_idx += 1
 
     burst_samples = []
     burst_meta = []
 
-    run = torch.zeros(N, dtype=torch.int32)
-    t = 0
-
-    while t < T:
-        xt = x[t]
-        run = torch.where(xt.bool(), run + 1, torch.zeros_like(run))
-
-        trigger_mask = run == consec_spikes
-        if trigger_mask.any():
-            trigger_neurons = trigger_mask.nonzero(as_tuple=False).flatten().tolist()
-
-            start = t
-            silent = 0
-            k = t
-            while k > 0:
-                k -= 1
-                if global_active[k].item():
-                    start = k
-                    silent = 0
-                else:
-                    silent += 1
-                    if silent >= start_silence_gap:
-                        break
-
-            silent_fwd = 0
-            last_active = t
-            t2 = t
-
-            hard_end = T - 1
-            if max_burst_len is not None:
-                hard_end = min(hard_end, start + max_burst_len - 1)
-
-            while t2 <= hard_end:
-                if global_active[t2].item():
-                    last_active = t2
-                    silent_fwd = 0
-                else:
-                    silent_fwd += 1
-                    if silent_fwd >= silence_gap:
-                        break
-                t2 += 1
-
-            end = last_active
-            burst_len = end - start + 1
-
-            if burst_len >= (min_burst_len or 0):
-                sample = x[start : end + 1].to(torch.float32)
-                burst_samples.append(sample)
-                burst_meta.append(
-                    {
-                        "start_idx": int(start),
-                        "end_idx": int(end),
-                        "duration_steps": int(burst_len),
-                        "duration_seconds": float(burst_len * data_dtres),
-                        "trigger_time_idx": int(t),
-                        "trigger_neurons": trigger_neurons,
-                        "start_silence_gap": int(start_silence_gap),
-                        "end_silence_gap": int(silence_gap),
-                    }
-                )
-
-            t = end + silence_gap + 1
-            run.zero_()
+    for run_start_window, run_end_window in burst_window_runs:
+        bins_in_run = (
+            valid_bin
+            & (window_for_bin >= run_start_window)
+            & (window_for_bin <= run_end_window)
+        )
+        run_bin_indices = torch.nonzero(bins_in_run, as_tuple=False).flatten()
+        if run_bin_indices.numel() == 0:
             continue
 
-        t += 1
+        run_activity = x[run_bin_indices].sum(dim=1)
+        peak_relative_idx = int(torch.argmax(run_activity).item())
+        peak_idx = int(run_bin_indices[peak_relative_idx].item())
+
+        # Backtrack from the 4 ms peak to the first bin in the uninterrupted run
+        # of network activity. Every retained bin has at least one active neuron.
+        start_idx = peak_idx
+        while start_idx > 0 and bool(global_active[start_idx - 1].item()):
+            start_idx -= 1
+
+        if max_burst_len is not None:
+            start_idx = max(start_idx, peak_idx - int(max_burst_len) + 1)
+
+        burst_len = peak_idx - start_idx + 1
+        if min_burst_len is not None and burst_len < int(min_burst_len):
+            continue
+
+        sample = x[start_idx : peak_idx + 1].to(torch.float32)
+        burst_samples.append(sample)
+
+        run_counts = active_counts[run_start_window : run_end_window + 1]
+        run_fractions = active_fractions[run_start_window : run_end_window + 1]
+        trigger_neurons = torch.nonzero(
+            active_neuron_masks[run_start_window],
+            as_tuple=False,
+        ).flatten().tolist()
+
+        burst_meta.append(
+            {
+                "start_idx": int(start_idx),
+                "end_idx": int(peak_idx),
+                "peak_idx": int(peak_idx),
+                "duration_steps": int(burst_len),
+                "duration_seconds": float(burst_len * data_dtres),
+                "nest_window_start_idx": int(run_start_window),
+                "nest_window_end_idx": int(run_end_window),
+                "nest_window_start_seconds": float(
+                    run_start_window * nest_window_ms / 1000.0
+                ),
+                "nest_window_end_seconds": float(
+                    (run_end_window + 1) * nest_window_ms / 1000.0
+                ),
+                "nest_trigger_active_neurons": int(
+                    active_counts[run_start_window].item()
+                ),
+                "nest_trigger_active_fraction": float(
+                    active_fractions[run_start_window].item()
+                ),
+                "nest_max_active_neurons": int(run_counts.max().item()),
+                "nest_max_active_fraction": float(run_fractions.max().item()),
+                "trigger_neurons": trigger_neurons,
+                "nest_window_ms": float(nest_window_ms),
+                "burst_threshold": float(min_network_activity_fraction),
+            }
+        )
 
     if return_device is not None:
-        burst_samples = [s.to(return_device) for s in burst_samples]
+        burst_samples = [sample.to(return_device) for sample in burst_samples]
 
     return burst_samples, burst_meta
 
 
 def parse_target_dataset_filename(filename: str) -> dict:
     match = re.fullmatch(
-        r"(?:fdata_)?N(?P<N>\d+)_p(?P<p>\d+)_CC(?P<cc>\d+)_(?P<dataset_idx>\d+)_inhOff?\.txt",
+        r"(?:fdata_)?N(?P<N>\d+)_p(?P<p>\d+)_CC(?P<cc>\d+)_(?P<dataset_idx>\d+)(?P<inh_off_suffix>_inhOff)?\.txt",
         filename,
     )
     if match is None:
         raise ValueError(
             "Filename must match one of these patterns: "
-            "'N<int>_p<int>_CC<int>_<dataset_idx>.txt', "
-            "'N<int>_p<int>_CC<int>_<dataset_idx>_.txt', or the same with an optional 'fdata_' prefix. "
+            "'N<int>_p<int>_CC<int>_<dataset_idx>.txt' or "
+            "'N<int>_p<int>_CC<int>_<dataset_idx>_inhOff.txt', "
+            "with an optional 'fdata_' prefix. "
             f"Got: {filename}"
         )
     parts = match.groupdict()
@@ -158,6 +282,7 @@ def parse_target_dataset_filename(filename: str) -> dict:
         "p": int(parts["p"]),
         "cc": int(parts["cc"]),
         "dataset_idx": int(parts["dataset_idx"]),
+        "has_inh_off_suffix": parts.get("inh_off_suffix") is not None,
     }
 
 
@@ -166,15 +291,15 @@ def resolve_reference_dataset_folder(input_path: str, reference_folder: str) -> 
 
     if reference_folder_path.is_absolute():
         dataset_dir = reference_folder_path
-    elif reference_folder_path.parts and reference_folder_path.parts[0] == "inhoff_fdata":
+    elif reference_folder_path.parts and reference_folder_path.parts[0] == "fdata":
         dataset_dir = Path(input_path) / reference_folder_path
     else:
-        dataset_dir = Path(input_path) / "inhoff_fdata" / reference_folder_path
+        dataset_dir = Path(input_path) / "fdata" / reference_folder_path
 
     if not dataset_dir.is_dir():
         raise FileNotFoundError(
             "Could not find target dataset folder. Expected either an absolute path, "
-            f"'{Path(input_path) / 'inhoff_fdata' / reference_folder}', or '{Path(input_path) / reference_folder}'. "
+            f"'{Path(input_path) / 'fdata' / reference_folder}', or '{Path(input_path) / reference_folder}'. "
             f"Resolved path: {dataset_dir}"
         )
 
@@ -202,10 +327,65 @@ def find_target_datasets_in_reference_folder(input_path: str, reference_folder: 
     return [path for _, path in matching_files]
 
 
-def make_output_npy_path(save_dir: str | Path, data_file_path: str | Path) -> str:
+def make_dataset_output_suffix(data_file_path: str | Path) -> str:
+    """Return the dataset suffix used in output filenames.
+
+    The target data files may be named either:
+      fdata_N100_p12_CC05_1.txt
+      fdata_N100_p12_CC05_1_inhOff.txt
+
+    Output files intentionally omit the legacy '_inhOff' suffix so both forms map
+    to the same learned-connectivity output name.
+    """
     data_file_path = Path(data_file_path)
     suffix = data_file_path.stem.removeprefix("fdata_")
-    return str(Path(save_dir) / f"connectivity_matrices_{suffix}_inhoff.npy")
+    suffix = suffix.removesuffix("_inhOff")
+    return suffix
+
+
+def make_output_npy_path(save_dir: str | Path, data_file_path: str | Path) -> str:
+    suffix = make_dataset_output_suffix(data_file_path)
+    return str(Path(save_dir) / f"connectivity_matrices_{suffix}.npy")
+
+
+def make_legacy_output_npy_path(save_dir: str | Path, data_file_path: str | Path) -> str:
+    """Return the old output path that may have kept/added '_inhOff' in the filename."""
+    suffix = make_dataset_output_suffix(data_file_path)
+    return str(Path(save_dir) / f"connectivity_matrices_{suffix}_inhOff.npy")
+
+
+def make_hamming_loss_output_npy_path(save_dir: str | Path, data_file_path: str | Path) -> str:
+    suffix = make_dataset_output_suffix(data_file_path)
+    return str(Path(save_dir) / f"final_hamming_losses_{suffix}.npy")
+
+
+def make_legacy_hamming_loss_output_npy_path(save_dir: str | Path, data_file_path: str | Path) -> str:
+    """Return the old Hamming-loss path that may have kept/added '_inhOff' in the filename."""
+    suffix = make_dataset_output_suffix(data_file_path)
+    return str(Path(save_dir) / f"final_hamming_losses_{suffix}_inhOff.npy")
+
+
+def learned_connectivity_output_exists(save_dir: str | Path, data_file_path: str | Path) -> bool:
+    """Return True if the normalized or legacy connectivity-matrix .npy output exists."""
+    return bool(existing_learned_connectivity_output_paths(save_dir, data_file_path))
+
+
+def existing_learned_connectivity_output_paths(save_dir: str | Path, data_file_path: str | Path) -> list[Path]:
+    """Return existing normalized/legacy connectivity output paths without duplicates."""
+    candidates = [
+        Path(make_output_npy_path(save_dir, data_file_path)),
+        Path(make_legacy_output_npy_path(save_dir, data_file_path)),
+    ]
+    existing_paths = []
+    seen = set()
+    for candidate in candidates:
+        candidate_key = candidate.resolve() if candidate.exists() else candidate.absolute()
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate.is_file():
+            existing_paths.append(candidate)
+    return existing_paths
 
 
 def load_burst_samples(data_file_path: str | Path, data_dtres: float):
@@ -223,9 +403,8 @@ def load_burst_samples(data_file_path: str | Path, data_dtres: float):
     burst_samples, burst_meta = extract_bursts_from_spiketrain(
         data=data,
         data_dtres=data_dtres,
-        consec_spikes=4,
-        silence_gap=3,
-        start_silence_gap=4,
+        nest_window_ms=nest_burst_detection_window_ms,
+        min_network_activity_fraction=min_network_activity_fraction,
         return_device=torch.device("cpu"),
     )
 
@@ -246,8 +425,9 @@ def load_burst_samples(data_file_path: str | Path, data_dtres: float):
 
 
 
-
+# -----------------------------
 # Weight initialization
+# -----------------------------
 def make_random_W(
     N: int,
     p: float,
@@ -268,15 +448,15 @@ def make_random_W(
     return W.to(device)
 
 
-
-#Utilities for target dataset
-#Only keeps first half of burst data (second half is from synaptic depression decay and we aren't learning that)
+# -----------------------------
+# Target utilities
+# -----------------------------
 def crop_target_to_peak(target_full: torch.Tensor) -> torch.Tensor:
     active = (target_full > 0).sum(dim=1)
     t_peak = int(torch.argmax(active).item())
     return target_full[: t_peak + 1].contiguous()
 
-#Finds the bin of the first neuron that spiked in a target sample
+
 def find_first_spike_bin_and_neurons(target_bins: torch.Tensor):
     for tb in range(target_bins.shape[0]):
         spikers = torch.nonzero(target_bins[tb] > 0, as_tuple=False).squeeze(-1)
@@ -285,8 +465,9 @@ def find_first_spike_bin_and_neurons(target_bins: torch.Tensor):
     raise ValueError("Target contains no spikes.")
 
 
-
+# -----------------------------
 # Surrogate spike function
+# -----------------------------
 class FastSigmoidSurrogate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_: torch.Tensor, beta: torch.Tensor):
@@ -306,8 +487,9 @@ def surrogate_spike(input_: torch.Tensor, beta: float = 10.0) -> torch.Tensor:
     return FastSigmoidSurrogate.apply(input_, beta_t)
 
 
-
+# -----------------------------
 # Differentiable LIF SNN
+# -----------------------------
 class SurrogateLIFNetwork(nn.Module):
     def __init__(
         self,
@@ -441,8 +623,9 @@ class SurrogateLIFNetwork(nn.Module):
         return spikes
 
 
-
-#Utilities for binning
+# -----------------------------
+# Binning utilities
+# -----------------------------
 def bin_spikes_hard(
     spikes: torch.Tensor,
     dt: float,
@@ -542,8 +725,9 @@ def scalar_soft_error(model_val_soft: torch.Tensor, target_val01: torch.Tensor) 
     return float(torch.abs(model_val_soft - target_val01.to(dtype=model_val_soft.dtype)).item())
 
 
-
+# -----------------------------
 # Prefix simulation / evaluation helpers
+# -----------------------------
 def simulate_prefix_soft(
     model: nn.Module,
     *,
@@ -758,8 +942,9 @@ def should_print_gradient_diagnostics(
     return periodic or suspect
 
 
-
+# -----------------------------
 # Plotting / saving
+# -----------------------------
 def plot_connectivity_matrix_and_strengths(W_global, title_prefix="Global connectivity"):
     W = torch.as_tensor(W_global).detach().cpu()
     N = W.shape[0]
@@ -799,30 +984,78 @@ def plot_connectivity_matrix_and_strengths(W_global, title_prefix="Global connec
 
 
 def save_sample_connectivity_npy(
-    sample_connectivity_matrices: list[torch.Tensor],
-    path: str = "sample_connectivity_matrices_inhoff.npy",
-    output_dtype: np.dtype = np.float32,
-):
+    sample_connectivity_matrices: list[torch.Tensor | np.ndarray],
+    path: str = "sample_connectivity_matrices.npy",
+) -> np.ndarray:
+    """
+    Save learned connectivity matrices as a single stacked NumPy array.
+
+    The output matches the reference connectivity-matrix .npy format:
+      shape = (num_samples, N, N)
+      dtype = float32
+
+    Each sample matrix is stored at output[sample_position, :, :]. The caller sorts
+    results by sample_idx before passing the matrices, so sample_position follows
+    ascending sample index.
+    """
     matrices_to_save = []
     for W in sample_connectivity_matrices:
         Wc = torch.as_tensor(W).detach().cpu().clone()
         Wc.fill_diagonal_(0.0)
-        matrices_to_save.append(Wc.numpy())
+        matrices_to_save.append(Wc.numpy().astype(np.float32, copy=False))
 
-    matrices_array = np.asarray(matrices_to_save, dtype=output_dtype)
+    if len(matrices_to_save) == 0:
+        matrices_array = np.empty((0, 0, 0), dtype=np.float32)
+    else:
+        matrices_array = np.ascontiguousarray(np.stack(matrices_to_save, axis=0), dtype=np.float32)
 
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
     np.save(path, matrices_array)
 
     print(
-        f"Saved {len(matrices_to_save)} sample connectivity matrices to: {path} "
-        f"| shape={matrices_array.shape}, dtype={matrices_array.dtype}"
+        f"Saved {matrices_array.shape[0]} sample connectivity matrices to: {path} "
+        f"(shape={matrices_array.shape}, dtype={matrices_array.dtype})"
+    )
+    return matrices_array
+
+
+def save_final_hamming_losses_npy(
+    results: list[dict],
+    path: str = "final_hamming_losses.npy",
+) -> np.ndarray:
+    """
+    Save per-sample final Hamming losses.
+
+    Output columns:
+      column 0 = sample_idx
+      column 1 = final_total_hamming
+
+    The rows are ordered by ascending sample_idx because the caller sorts results
+    before passing them in.
+    """
+    hamming_loss_array = np.asarray(
+        [
+            [int(result["sample_idx"]), int(result["final_total_hamming"])]
+            for result in results
+        ],
+        dtype=np.int64,
     )
 
+    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    np.save(path, hamming_loss_array)
+
+    print(
+        f"Saved final Hamming losses to: {path} "
+        f"(shape={hamming_loss_array.shape}, dtype={hamming_loss_array.dtype}; "
+        "columns=[sample_idx, final_total_hamming])"
+    )
+    return hamming_loss_array
 
 
+# -----------------------------
 # Training config
-dt = 1e-3
+# -----------------------------
+dt = 4e-3 #1e-3
 bin_dt = 4e-3
 train_seed = 1
 
@@ -832,25 +1065,23 @@ dtype = torch.float64
 init_delay_bins = 1
 stim_value_nA = 70.0
 
-# Per-neuron / per-timestep greedy training.
 max_neuron_train_iters = 100
-max_attempts_per_neuron_time = 6
+max_attempts_per_neuron_time = 2
 learning_rate = 3e-1#3e-1
 attempt_lr_decay = 0.5
 restart_noise_std = 0.05
 surrogate_beta = 7.0
 grad_clip_norm = 10.0
 
-# Small regularizers / safeguards during the candidate search.
+#regularizers
 l1_lambda = 0  # 5e-5
 previous_soft_barrier_scale = 0.5
 current_soft_improve_tol = 1e-7
 
-# Restrict candidate presynaptic neurons to the recent model history and make
-# learning stronger for more recent spikes.
+#restrict candidate presynaptic neurons to the recent model history and make learning stronger for more recent spikes.
 presynaptic_history_window_bins = 6
 
-# Optional gradient diagnostics for debugging stalls near the end of a sample.
+#optional gradient diagnostics for debugging stalls near the end of a sample
 enable_gradient_diagnostics = False
 gradient_diag_print_every_inner_iters = 10
 gradient_diag_only_when_suspect = False
@@ -859,15 +1090,19 @@ grad_vanish_threshold = 1e-10
 grad_explode_threshold = 1e2
 weight_large_threshold = 9.5
 
-# Training selection.
+
 max_samples_to_use = None
 selected_sample_idx = None  # set to an integer index to train only one sample
 
-# Plotting remains optional and is performed in the main process after workers finish.
+#Dataset-level skipping. When True, any target dataset whose normalized
+#connectivity_matrices_<dataset_suffix>.npy file already exists in LIFoutput_files is skipped before loading or training that dataset.
+enable_skip_trained_samples = True
+
+
 plot_overlay_for_each_sample = False
 plot_overlay_for_sample_indices = set()
 
-# Parallel sample training.
+#parallel sample training
 parallel_train_samples = True
 max_parallel_workers = os.cpu_count()
 worker_torch_threads = 1
@@ -878,7 +1113,7 @@ bin_dt_eff = bin_steps * dt
 t_stim = init_delay_bins * bin_steps
 
 p = 0.2
-G = 0.0 #currently no initial connections
+G = 0.0  #initialization stuff
 
 
 def build_sample_iter(burst_samples: list[torch.Tensor], *, selected_sample_idx, max_samples_to_use):
@@ -1299,19 +1534,15 @@ def train_single_sample(task: dict) -> dict:
         bin_steps=bin_steps,
     )
     final_total_hamming = int(hamming_loss_per_timestep(final_stage_hard, target).sum().item())
-    save_loss_threshold = 0.05 * N
-    should_save_sample = final_total_hamming <= save_loss_threshold
 
     return {
         "sample_idx": s_idx,
-        "W_sample": W_sample.numpy(),
+        "W_sample": W_sample.numpy().astype(np.float32, copy=False),
         "accepted_updates": accepted_updates,
         "rejected_updates": rejected_updates,
         "skipped_updates": skipped_updates,
         "starter_bin_hamming": prefix0_loss,
         "final_total_hamming": final_total_hamming,
-        "save_loss_threshold": save_loss_threshold,
-        "should_save_sample": should_save_sample,
         "plot_payload": plot_payload,
     }
 
@@ -1435,25 +1666,17 @@ def train_one_dataset(data_file_path: str | Path):
     results.sort(key=lambda x: x["sample_idx"])
     sample_connectivity_matrices = []
     for result in results:
-        if result["should_save_sample"]:
-            W_sample = torch.as_tensor(result["W_sample"], dtype=dtype, device="cpu")
-            W_sample.fill_diagonal_(0.0)
-            sample_connectivity_matrices.append(W_sample)
-            print(
-                f"Saving sample {result['sample_idx']} "
-                f"(final_total_hamming={result['final_total_hamming']}, "
-                f"threshold={result['save_loss_threshold']:.4f})."
-            )
-        else:
-            print(
-                f"Skipping save for sample {result['sample_idx']} "
-                f"because final_total_hamming={result['final_total_hamming']} "
-                f"exceeds threshold={result['save_loss_threshold']:.4f}."
-            )
+        W_sample = torch.as_tensor(result["W_sample"], dtype=torch.float32, device="cpu")
+        W_sample.fill_diagonal_(0.0)
+        sample_connectivity_matrices.append(W_sample)
+        print(
+            f"Saving sample {result['sample_idx']} "
+            f"(final_total_hamming={result['final_total_hamming']})."
+        )
         if result["plot_payload"] is not None:
             plot_overlay_from_payload(result["sample_idx"], result["plot_payload"])
 
-    print(f"\nTrained on {len(sample_connectivity_matrices)} saved samples from {Path(data_file_path).name}.")
+    print(f"\nTrained on and saved {len(sample_connectivity_matrices)} samples from {Path(data_file_path).name}.")
 
     if len(sample_connectivity_matrices) == 1:
         plot_connectivity_matrix_and_strengths(
@@ -1468,9 +1691,14 @@ def train_one_dataset(data_file_path: str | Path):
 
     save_dir = Path(input_path) / "LIFoutput_files"
     output_npy_path = make_output_npy_path(save_dir, data_file_path)
+    hamming_loss_npy_path = make_hamming_loss_output_npy_path(save_dir, data_file_path)
     save_sample_connectivity_npy(
         sample_connectivity_matrices,
         path=str(output_npy_path),
+    )
+    save_final_hamming_losses_npy(
+        results,
+        path=str(hamming_loss_npy_path),
     )
 
 
@@ -1478,22 +1706,42 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Train the SNN on all target dataset text files inside the requested reference folder. "
-            "The folder is resolved relative to <input_path>/inhoff_fdata/ unless you provide an absolute path "
-            "or a path starting with inhoff_fdata/."
+            "The folder is resolved relative to <input_path>/fdata/ unless you provide an absolute path "
+            "or a path starting with fdata/."
         )
     )
     parser.add_argument(
         "reference_target_filename",
         help=(
             "Reference dataset folder name, for example 'N100_p24_CC03'. "
-            "You can also pass an absolute path or a path starting with 'inhoff_fdata/'."
+            "You can also pass an absolute path or a path starting with 'fdata/'."
+        ),
+    )
+    parser.add_argument(
+        "--skip-trained-samples",
+        action="store_true",
+        help=(
+            "Skip each target dataset whose normalized learned connectivity matrix .npy "
+            "already exists in LIFoutput_files. The normalized output name omits any "
+            "legacy '_inhOff' suffix. This overrides enable_skip_trained_samples=False."
+        ),
+    )
+    parser.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help=(
+            "Train every target dataset even if its learned connectivity matrix .npy "
+            "already exists. This overrides enable_skip_trained_samples=True."
         ),
     )
     return parser.parse_args()
 
 
-def main(reference_target_filename: str):
+def main(reference_target_filename: str, *, skip_trained_samples: bool | None = None):
     configure_global_reproducibility(seed)
+
+    if skip_trained_samples is None:
+        skip_trained_samples = enable_skip_trained_samples
 
     dataset_files = find_target_datasets_in_reference_folder(
         input_path=input_path,
@@ -1507,14 +1755,46 @@ def main(reference_target_filename: str):
     for dataset_file in dataset_files:
         print(f"  - {dataset_file.name}")
 
+    save_dir = Path(input_path) / "LIFoutput_files"
+    skipped_dataset_count = 0
+    trained_dataset_count = 0
+
     for dataset_file in dataset_files:
+        output_npy_path = Path(make_output_npy_path(save_dir, dataset_file))
+        existing_output_paths = existing_learned_connectivity_output_paths(save_dir, dataset_file)
+
+        if skip_trained_samples and existing_output_paths:
+            skipped_dataset_count += 1
+            print(f"\n{'=' * 80}")
+            print(f"Skipping dataset because learned connectivity output already exists: {dataset_file.name}")
+            for existing_output_path in existing_output_paths:
+                print(f"Existing output: {existing_output_path}")
+            print(f"{'=' * 80}")
+            continue
+
         print(f"\n{'=' * 80}")
         print(f"Starting training for dataset: {dataset_file.name}")
+        if skip_trained_samples:
+            print(f"No existing learned connectivity output found at: {output_npy_path}")
         print(f"{'=' * 80}")
         train_one_dataset(dataset_file)
+        trained_dataset_count += 1
+
+    print(
+        f"\nDataset loop complete: trained={trained_dataset_count}, "
+        f"skipped_existing_outputs={skipped_dataset_count}, total={len(dataset_files)}."
+    )
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args.reference_target_filename) #takes data's folder as arguements, makes training with bash loops easier and cleaner
-    
+    if args.skip_trained_samples and args.force_retrain:
+        raise ValueError("Use either --skip-trained-samples or --force-retrain, not both.")
+
+    skip_override = None
+    if args.skip_trained_samples:
+        skip_override = True
+    elif args.force_retrain:
+        skip_override = False
+
+    main(args.reference_target_filename, skip_trained_samples=skip_override)
