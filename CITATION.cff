@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the repository and associated MSc thesis."
+title: "SNN Connectivity Inference"
+type: software
+authors:
+  - family-names: Ulisnyak
+    given-names: Benjamin A.
+repository-code: "https://github.com/benulisnyak/SNN_causal_inference"
+license: MIT
+version: 1.0.0
+date-released: 2026-08-08
+keywords:
+  - spiking neural networks
+  - connectivity inference
+  - computational neuroscience
+  - gradient boosting

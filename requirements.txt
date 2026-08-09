@@ -1,0 +1,10 @@
+# Full research environment. For a lightweight recruiter-facing demo, use:
+#   pip install -e ".[dev]"
+matplotlib>=3.7
+networkx>=3.1
+numpy>=1.24
+pandas>=2.0
+PyYAML>=6.0
+scikit-learn>=1.3
+scipy>=1.10
+torch>=2.0
